@@ -126,7 +126,6 @@ PALADIN = {
         { id = 47860, name = "Death Coil", tooltip = "Blocks Death Coil" },
         { id = 47891, name = "Shadow Ward", tooltip = "Blocks Shadow Ward" },
         { id = 47883, name = "Soulshatter", tooltip = "Blocks Soulshatter" },
-        { id = 47193, name = "Demonic Empowerment", tooltip = "Blocks Demonic Empowerment" },
         { id = 47996, name = "Intercept (Felguard)", tooltip = "Blocks Felguard's Intercept" },
     },
     ROGUE = {
@@ -228,16 +227,26 @@ local function InitDB()
         SpellBlockerDB = {} 
     end
     
+    -- Previous State für Vergleich initialisieren
+    if not SpellBlockerPreviousState then
+        SpellBlockerPreviousState = {}
+    end
+    
     -- Für jede Klasse die DB initialisieren
     for className, spells in pairs(SPELLS) do
         if not SpellBlockerDB[className] then 
             SpellBlockerDB[className] = {} 
+        end
+        if not SpellBlockerPreviousState[className] then
+            SpellBlockerPreviousState[className] = {}
         end
         for _, spell in ipairs(spells) do
             if SpellBlockerDB[className][spell.id] == nil then
                 -- Standardeinstellung: Zauber NICHT blockieren
                 SpellBlockerDB[className][spell.id] = false
             end
+            -- PreviousState mit aktuellem State initialisieren
+            SpellBlockerPreviousState[className][spell.id] = SpellBlockerDB[className][spell.id]
         end
     end
 end
@@ -652,63 +661,77 @@ local function CreateSpellBlockCommand(class)
         end
     end
     
-    return command
+    -- Standardmäßig ein Array zurückgeben
+    return {command}
 end
 
--- Funktion zum Senden der Befehle an alle Spieler im Raid/Gruppe
+-- Aktualisiere auch die SendBlockCommandsToGroup Funktion:
 local function SendBlockCommandsToGroup()
     -- Prüfe, ob wir in einer Gruppe oder Raid sind
     local numMembers = GetNumRaidMembers()
     local isRaid = (numMembers > 0)
+    local inGroup = true
     
     if not isRaid then
         numMembers = GetNumPartyMembers()
         if numMembers == 0 then
-            print("|cFFFF0000SpellBlocker:|r You are not in a group/raid.")
-            return
+            inGroup = false
+            -- Auch wenn wir allein sind, aktualisieren wir trotzdem die Zauber für den Spieler
+            print("|cFFFF0000SpellBlocker:|r You are not in a group/raid. Commands will only affect you.")
         end
     end
     
     -- Sammele Spieler nach Klasse
     local playersByClass = {}
     
-    -- Verarbeite alle Gruppenmitglieder
-    for i = 1, numMembers do
-        local unit = isRaid and "raid"..i or "party"..i
-        local name = UnitName(unit)
-        local _, class = UnitClass(unit)
-        
-        if name and class then
-            if not playersByClass[class] then
-                playersByClass[class] = {}
+    if inGroup then
+        -- Verarbeite alle Gruppenmitglieder
+        for i = 1, numMembers do
+            local unit = isRaid and "raid"..i or "party"..i
+            local name = UnitName(unit)
+            local _, class = UnitClass(unit)
+            
+            if name and class then
+                if not playersByClass[class] then
+                    playersByClass[class] = {}
+                end
+                table.insert(playersByClass[class], name)
             end
-            table.insert(playersByClass[class], name)
         end
     end
     
-    -- Füge den eigenen Spieler hinzu, falls er nicht bereits hinzugefügt wurde
+    -- IMMER den eigenen Spieler hinzufügen, unabhängig vom Gruppenstatus
     local playerName = UnitName("player")
     local _, playerClass = UnitClass("player")
-    if not (isRaid or numMembers == 0) then  -- In einer Party, aber nicht in einem Raid
-        if not playersByClass[playerClass] then
-            playersByClass[playerClass] = {}
-        end
-        table.insert(playersByClass[playerClass], playerName)
+    
+    if not playersByClass[playerClass] then
+        playersByClass[playerClass] = {}
     end
+    table.insert(playersByClass[playerClass], playerName)
     
     -- Sende Befehle an alle Spieler
     local totalMessages = 0
+    
+    -- Erstelle Kommandos für alle Klassen, für die wir Änderungen haben
+    local allClassCommands = {}
+    for className, spells in pairs(SPELLS) do
+        allClassCommands[className] = CreateSpellBlockCommand(className)
+    end
+    
+    -- Sende nur Kommandos an Klassen, die wir gefunden haben
     for class, players in pairs(playersByClass) do
-        local command = CreateSpellBlockCommand(class)
-        if command then
+        local commands = allClassCommands[class]
+        if commands and #commands > 0 then
             for _, playerName in ipairs(players) do
-                SendChatMessage(command, "WHISPER", nil, playerName)
-                totalMessages = totalMessages + 1
+                for _, command in ipairs(commands) do
+                    SendChatMessage(command, "WHISPER", nil, playerName)
+                    totalMessages = totalMessages + 1
+                end
             end
         end
     end
     
-    print("|cFF00FF00SpellBlocker:|r " .. totalMessages .. " blocking commands sent.")
+    print("|cFF00FF00SpellBlocker:|r " .. totalMessages .. " spell commands sent.")
 end
 
 -- Erstelle den großen Block All-Button
@@ -733,9 +756,10 @@ end
 blockAllBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText("SpellBlocker", 1, 1, 1)
-    GameTooltip:AddLine("Left-click to send commands", 0, 1, 0) 
+    GameTooltip:AddLine("Left-click to send block commands", 0, 1, 0) 
+    GameTooltip:AddLine("Shift+Left-click to reset all blocks", 1, 0.5, 0)  -- Neuer Eintrag 
     GameTooltip:AddLine("Right-click to open options", 0, 1, 0)
-    GameTooltip:AddLine("Hold Shift+Left-click to move", 0.7, 0.7, 1)
+    GameTooltip:AddLine("Drag with Shift to move", 0.7, 0.7, 1)
     GameTooltip:Show()
 end)
 blockAllBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -767,28 +791,115 @@ blockAllBtn:SetScript("OnClick", function(self, button)
         -- Optionsfenster bei Rechtsklick öffnen
         optionsFrame:Show()
     else
-        -- Befehle bei Linksklick senden (Standard)
-        SendBlockCommandsToGroup()
+        if IsShiftKeyDown() then
+            -- Shift+Linksklick: Blocklisten zurücksetzen
+            ResetAllBlockLists()
+        else
+            -- Normaler Linksklick: Befehle senden
+            SendBlockCommandsToGroup()
+        end
     end
 end)
 
--- OnEvent Handler für Initialisierung
-local f = CreateFrame("Frame")
-f:RegisterEvent("ADDON_LOADED")
-f:SetScript("OnEvent", function(self, event, arg1)
-    if arg1 == addonName then
-        InitDB()
-        CreateClassTabs()
-        RefreshClassSpellDisplay()
-    end
-end)
+-- Füge diese neue Funktion hinzu (vor dem blockAllBtn Click-Handler):
 
--- Öffne das Optionsfenster mit einem Slash-Befehl
-SLASH_SPELLBLOCKER1 = "/spellblocker"
-SLASH_SPELLBLOCKER2 = "/sb"
-SlashCmdList["SPELLBLOCKER"] = function()
-    optionsFrame:Show()
+-- Funktion zum Zurücksetzen aller Blocklisten für alle Klassen
+local function ResetAllBlockLists()
+    -- Sammele Spieler nach Klasse
+    local playersByClass = {}
+    local numMembers = GetNumRaidMembers()
+    local isRaid = (numMembers > 0)
+    
+    if not isRaid then
+        numMembers = GetNumPartyMembers()
+    end
+    
+    -- Verarbeite alle Gruppenmitglieder
+    if numMembers > 0 then
+        for i = 1, numMembers do
+            local unit = isRaid and "raid"..i or "party"..i
+            local name = UnitName(unit)
+            local _, class = UnitClass(unit)
+            
+            if name and class then
+                if not playersByClass[class] then
+                    playersByClass[class] = {}
+                end
+                table.insert(playersByClass[class], name)
+            end
+        end
+    end
+    
+    -- Eigenen Spieler immer hinzufügen
+    local playerName = UnitName("player")
+    local _, playerClass = UnitClass("player")
+    if not playersByClass[playerClass] then
+        playersByClass[playerClass] = {}
+    end
+    table.insert(playersByClass[playerClass], playerName)
+    
+    -- Für jede Klasse einen Reset-Befehl mit einer beispielhaften SpellID senden
+    local totalMessages = 0
+    for class, players in pairs(playersByClass) do
+        -- Finde die erste gültige SpellID für diese Klasse
+        local resetSpellId = nil
+        for _, spell in ipairs(SPELLS[class]) do
+            if spell.id > 0 then  -- Erste gültige SpellID verwenden
+                resetSpellId = spell.id
+                break
+            end
+        end
+        
+        if resetSpellId then
+            local resetCommand = "ss -" .. resetSpellId
+            for _, playerName in ipairs(players) do
+                SendChatMessage(resetCommand, "WHISPER", nil, playerName)
+                totalMessages = totalMessages + 1
+            end
+        end
+    end
+    
+    -- Status in der DB zurücksetzen (optional)
+    for className, spells in pairs(SPELLS) do
+        for _, spell in ipairs(spells) do
+            if spell.id > 0 then  -- Nur echte Zauber, keine Separatoren
+                SpellBlockerDB[className][spell.id] = false
+            end
+        end
+    end
+    
+    -- UI aktualisieren
+    RefreshClassSpellDisplay()
+    
+    print("|cFF00FF00SpellBlocker:|r " .. totalMessages .. " reset commands sent. All spell blocks removed.")
 end
+
+-- Ändere den Click-Handler für den blockAllBtn:
+blockAllBtn:SetScript("OnClick", function(self, button)
+    if button == "RightButton" then
+        -- Optionsfenster bei Rechtsklick öffnen
+        optionsFrame:Show()
+    else
+        if IsShiftKeyDown() then
+            -- Shift+Linksklick: Blocklisten zurücksetzen
+            ResetAllBlockLists()
+        else
+            -- Normaler Linksklick: Befehle senden
+            SendBlockCommandsToGroup()
+        end
+    end
+end)
+
+-- Aktualisiere den Tooltip, um die neue Funktion zu erklären:
+blockAllBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("SpellBlocker", 1, 1, 1)
+    GameTooltip:AddLine("Left-click to send block commands", 0, 1, 0) 
+    GameTooltip:AddLine("Shift+Left-click to reset all blocks", 1, 0.5, 0)  -- Neuer Eintrag 
+    GameTooltip:AddLine("Right-click to open options", 0, 1, 0)
+    GameTooltip:AddLine("Drag with Shift to move", 0.7, 0.7, 1)
+    GameTooltip:Show()
+end)
 
 -- Minimap Button-Funktionalität korrigieren
 local miniBtn = CreateFrame("Button", "SpellBlockerMiniMap", Minimap)
@@ -877,6 +988,50 @@ function RefreshClassSpellDisplay()
         healOnlyBtn:Hide()
     end
 end
+
+-- Füge einen OnShow-Handler für das optionsFrame hinzu direkt nach der Definition des okBtn:
+
+optionsFrame:SetScript("OnShow", function()
+    -- Erstelle die Klassen-Tabs, wenn sie noch nicht erstellt wurden
+    if #tabs == 0 then
+        CreateClassTabs()
+    end
+    
+    -- Nutze die gespeicherte Tab-Auswahl oder die Spielerklasse
+    if SpellBlockerLastActiveTab then
+        currentClass = SpellBlockerLastActiveTab
+    else
+        currentClass = select(2, UnitClass("player"))
+    end
+    
+    -- Aktualisiere die Tabs-Auswahl visuell
+    for _, tab in ipairs(tabs) do
+        if tab.class == currentClass then
+            tab.border:Show()
+        else
+            tab.border:Hide()
+        end
+    end
+    
+    -- Icons für die aktuelle Klasse anzeigen
+    RefreshClassSpellDisplay()
+end)
+
+-- Füge am Ende des Files diesen Event-Handler hinzu:
+-- Addon-Initialisierung 
+local f = CreateFrame("Frame")
+f:RegisterEvent("ADDON_LOADED")
+f:SetScript("OnEvent", function(self, event, arg1)
+    if event == "ADDON_LOADED" and arg1 == "spellblocker" then
+        -- DB initialisieren
+        InitDB()
+        
+        -- Klassen-Tabs erstellen, wenn das Fenster noch nicht geöffnet wurde
+        if #tabs == 0 then
+            CreateClassTabs()
+        end
+    end
+end)
 
 
 
